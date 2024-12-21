@@ -1,10 +1,11 @@
-import os
 import pyodbc
+import os
+import pandas as pd
 
 # Database connection settings
-server = 'SERVER NAME'
+server = 'YOUR_SERVER_NAME'
 
-# Connect to the SQL Server using Trusted Connection
+# Trusted connection (Windows Authentication)
 conn = pyodbc.connect(
     f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={server};Trusted_Connection=yes;"
 )
@@ -21,8 +22,8 @@ WHERE state = 0 AND name NOT IN ('master', 'model', 'msdb', 'tempdb');
 cursor.execute(get_databases_query)
 databases = cursor.fetchall()
 
-# Create a list to store the SELECT statements
-select_statements = []
+# Create a list to store the data
+data = []
 
 for db_row in databases:
     db_name = db_row[0]
@@ -46,23 +47,29 @@ for db_row in databases:
                 f"SELECT TOP 10 *, '{view_name}' AS ViewName "
                 f"FROM [{db_name}].[{schema_name}].[{view_name}];"
             )
-            select_statements.append(select_statement)
+            # Append data to the list
+            data.append({
+                "Database": db_name,
+                "Schema": schema_name,
+                "ViewName": view_name,
+                "SelectStatement": select_statement
+            })
 
     except Exception as e:
         print(f"Unable to access database {db_name}: {str(e)}")
 
-# Determine the desktop directory
-desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-output_file = os.path.join(desktop_path, "select_statements.sql")
+# Convert data to a pandas DataFrame
+df = pd.DataFrame(data, columns=["Database", "Schema", "ViewName", "SelectStatement"])
 
-# Write all statements to the file on the desktop
-with open(output_file, "w") as f:
-    for stmt in select_statements:
-        f.write(stmt + "\n")
+# Define the path to save the Excel file
+desktop_path = r"YOUR PATH TO DESKTOP"
+output_file = os.path.join(desktop_path, "Database_Views_Selects.xlsx")
 
-print(f"SELECT statements written to {output_file}")
+# Save to Excel
+df.to_excel(output_file, index=False)
+
+print(f"Excel file saved to {output_file}")
 
 # Close the connection
 cursor.close()
 conn.close()
-
