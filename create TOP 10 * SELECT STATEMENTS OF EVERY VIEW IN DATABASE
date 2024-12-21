@@ -3,7 +3,7 @@ import os
 import pandas as pd
 
 # Database connection settings
-server = 'YOUR_SERVER_NAME'
+server = 'SERVER NAME'
 
 # Trusted connection (Windows Authentication)
 conn = pyodbc.connect(
@@ -44,8 +44,7 @@ for db_row in databases:
 
             # Generate SELECT TOP 10 * statement
             select_statement = (
-                f"SELECT TOP 10 *, '{view_name}' AS ViewName "
-                f"FROM [{db_name}].[{schema_name}].[{view_name}];"
+                f"SELECT TOP 10 * FROM [{db_name}].[{schema_name}].[{view_name}];"
             )
             # Append data to the list
             data.append({
@@ -62,7 +61,7 @@ for db_row in databases:
 df = pd.DataFrame(data, columns=["Database", "Schema", "ViewName", "SelectStatement"])
 
 # Define the path to save the Excel file
-desktop_path = r"YOUR PATH TO DESKTOP"
+desktop_path = r"output path"
 output_file = os.path.join(desktop_path, "Database_Views_Selects.xlsx")
 
 # Save to Excel
