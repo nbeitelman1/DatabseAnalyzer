@@ -1,0 +1,1220 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import threading
+import time
+import logging
+import pandas as pd
+import numpy as np
+import pyodbc
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+import networkx as nx
+import matplotlib.pyplot as plt
+from datetime import datetime
+import schedule
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import openai  # Ensure OpenAI is imported
+import os  # For environment variables and file operations
+import json  # For optional config handling
+import sqlparse  # For better SQL parsing
+
+# ----------------------------------------------
+# APPLICATION CONFIGURATION
+# ----------------------------------------------
+class AppConfig:
+    LOG_FILE = "app_log.txt"
+    LOG_LEVEL = logging.DEBUG
+    MAX_WORKERS = 4
+    QUERY_TIMEOUT_SECS = 300  # 5 minutes
+    CHUNK_SIZE = 10000
+    EXCEL_ROW_LIMIT = 1048576
+    EXPORT_FORMATS = ["xlsx", "csv", "json"]
+
+    # Toggle email notifications
+    EMAIL_NOTIFICATIONS = False
+    EMAIL_CONFIG = {
+        "sender": "example@gmail.com",
+        "recipient": "recipient@example.com",
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587,
+        "password": "yourpassword"
+    }
+
+    # Optional: Save directory configuration
+    SAVE_DIR_CONFIG = "config.json"
+
+    # **Retrieve the OpenAI API Key from environment variables**
+    OPENAI_API_KEY = "ENTER IT HERE"  
+
+
+    @staticmethod
+    def get_save_directory():
+        if os.path.exists(AppConfig.SAVE_DIR_CONFIG):
+            try:
+                with open(AppConfig.SAVE_DIR_CONFIG, 'r') as f:
+                    config = json.load(f)
+                    return config.get('save_directory', '')
+            except Exception as e:
+                logging.error(f"Error reading save directory config: {e}")
+        return ''
+
+    @staticmethod
+    def set_save_directory(directory):
+        config = {}
+        if os.path.exists(AppConfig.SAVE_DIR_CONFIG):
+            try:
+                with open(AppConfig.SAVE_DIR_CONFIG, 'r') as f:
+                    config = json.load(f)
+            except Exception as e:
+                logging.error(f"Error reading save directory config for setting: {e}")
+        config['save_directory'] = directory
+        try:
+            with open(AppConfig.SAVE_DIR_CONFIG, 'w') as f:
+                json.dump(config, f)
+        except Exception as e:
+            logging.error(f"Error writing save directory config: {e}")
+
+# Configure logging
+logging.basicConfig(
+    filename=AppConfig.LOG_FILE,
+    level=AppConfig.LOG_LEVEL,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# ----------------------------------------------
+# MAIN APPLICATION
+# ----------------------------------------------
+class DatabaseAnalyzerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Enhanced Database Analyzer")
+        self.root.geometry("1600x1000")
+
+        # Tkinter variables
+        self.server_var = tk.StringVar()
+        self.selected_db_var = tk.StringVar(value="All")
+        self.query_mode = tk.StringVar(value="Self")  # "Self", "AllOther", "Both"
+
+        # Holds all queries loaded from Excel
+        self.all_queries = []
+        # Unique list of databases that appear in the queries
+        self.databases_available = set()
+
+        # Where we store query results dataframes: { "DB.ViewName": DataFrame, ... }
+        self.dataframes = {}
+        # Relationship DataFrame
+        self.relationship_df = pd.DataFrame()
+        # A NetworkX graph for relationships
+        self.rel_graph = None
+
+        # Threading and concurrency controls
+        self.pause_event = threading.Event()
+        self.pause_event.clear()  # Not paused initially
+        self.lock = threading.Lock()
+
+        # Progress tracking
+        self.total_queries = 0
+        self.completed_queries = 0
+        self.start_time = None
+
+        # For Real-Time Dashboard: keep track of statuses
+        self.query_stats = []  # List of dicts: [{"Query": "...", "Database": "...", "Rows": N, "Status": "..."}]
+
+        # Build the GUI
+        self.setup_gui()
+
+    # --------------------------------------------------
+    # Setup GUI
+    # --------------------------------------------------
+    def setup_gui(self):
+        # 1) Top Frame: Connection & Queries
+        top_frame = tk.LabelFrame(self.root, text="Connection & Queries", padx=10, pady=10)
+        top_frame.pack(fill='x', padx=5, pady=5)
+
+        tk.Label(top_frame, text="Server Name:").grid(row=0, column=0, sticky='e')
+        tk.Entry(top_frame, textvariable=self.server_var, width=40).grid(row=0, column=1, padx=5, pady=5)
+
+        tk.Button(top_frame, text="Load Queries", command=self.load_queries, bg="#2196F3", fg="white")\
+            .grid(row=0, column=2, padx=5)
+
+        tk.Button(top_frame, text="Generate Excel", command=self.generate_excel_from_server, bg="#4CAF50", fg="white")\
+            .grid(row=0, column=3, padx=5)
+
+        tk.Label(top_frame, text="Select Database:").grid(row=0, column=4, sticky='e')
+        self.db_selector = ttk.Combobox(top_frame, textvariable=self.selected_db_var, state="readonly", width=30)
+        self.db_selector.grid(row=0, column=5, padx=5, pady=5)
+        self.db_selector['values'] = ("All",)
+
+        tk.Label(top_frame, text="Query Mode:").grid(row=0, column=6, sticky='e')
+        self.query_mode_selector = ttk.Combobox(top_frame, textvariable=self.query_mode, state="readonly", width=20)
+        self.query_mode_selector['values'] = ("Self", "AllOther", "Both")
+        self.query_mode_selector.grid(row=0, column=7, padx=5, pady=5)
+
+        # 2) Query Frame: Display loaded queries
+        query_frame = tk.LabelFrame(self.root, text="Loaded Queries", padx=10, pady=10)
+        query_frame.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self.query_text = scrolledtext.ScrolledText(query_frame, width=180, height=15, state='disabled')
+        self.query_text.pack(fill='both', expand=True)
+
+        # 3) Control Frame: Analysis Control
+        control_frame = tk.Frame(self.root)
+        control_frame.pack(fill='x', pady=5)
+
+        tk.Button(control_frame, text="Start Analysis", command=self.start_analysis, bg="#008CBA", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(control_frame, text="Pause", command=self.pause_analysis, bg="gray", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(control_frame, text="Resume", command=self.resume_analysis, bg="gray", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(control_frame, text="Toggle Dark Mode", command=self.toggle_dark_mode, bg="black", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(control_frame, text="SQL Console", command=self.open_sql_console, bg="#9C27B0", fg="white")\
+            .pack(side='left', padx=5)
+
+        # Button for AI-Assisted JOIN Statement Generation
+        tk.Button(control_frame, text="AI Assist: Generate JOIN", command=self.open_ai_join_window, bg="#673AB7", fg="white")\
+            .pack(side='left', padx=5)
+
+        self.progress_bar = ttk.Progressbar(control_frame, orient='horizontal', length=300, mode='determinate')
+        self.progress_bar.pack(side='left', padx=5)
+        self.progress_label = tk.Label(control_frame, text="0%")
+        self.progress_label.pack(side='left')
+        self.eta_label = tk.Label(control_frame, text="ETA: --")
+        self.eta_label.pack(side='left', padx=5)
+
+        # 4) Relationship Frame
+        rel_frame = tk.LabelFrame(self.root, text="Relationship Analysis", padx=10, pady=10)
+        rel_frame.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self.rel_text = scrolledtext.ScrolledText(rel_frame, width=180, height=20, state='disabled')
+        self.rel_text.pack(fill='both', expand=True)
+
+        # 5) Export / Visualization / Scheduling / Dashboard
+        export_frame = tk.Frame(self.root)
+        export_frame.pack(fill='x', pady=5)
+
+        tk.Button(export_frame, text="Export Report", command=self.export_report, bg="#FF9800", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(export_frame, text="Visualize Graph", command=self.visualize_relationships, bg="#795548", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(export_frame, text="Set Schedule", command=self.schedule_analysis, bg="#3F51B5", fg="white")\
+            .pack(side='left', padx=5)
+        tk.Button(export_frame, text="Real-Time Dashboard", command=self.open_dashboard, bg="#009688", fg="white")\
+            .pack(side='left', padx=5)
+
+        # 6) Log Frame
+        log_frame = tk.LabelFrame(self.root, text="Real-time Logs", padx=10, pady=10)
+        log_frame.pack(fill='both', expand=True, padx=5, pady=5)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, width=180, height=15, state='disabled')
+        self.log_text.pack(fill='both', expand=True)
+
+    # --------------------------------------------------
+    # 1) LOAD QUERIES
+    # --------------------------------------------------
+    def load_queries(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Excel with Queries",
+            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+        try:
+            df = pd.read_excel(file_path)
+        except Exception as e:
+            self.log(f"Error reading Excel: {e}", logging.ERROR)
+            messagebox.showerror("Error", str(e))
+            return
+
+        required = {"Database", "Schema", "ViewName", "SelectStatement"}
+        if not required.issubset(df.columns):
+            msg = f"Excel must contain columns {required}."
+            self.log(msg, level=logging.ERROR)
+            messagebox.showerror("Error", msg)
+            return
+
+        # Clear previous data
+        self.all_queries.clear()
+        self.databases_available.clear()
+
+        self.query_text.config(state='normal')
+        self.query_text.delete('1.0', tk.END)
+
+        # Read queries
+        for _, row in df.iterrows():
+            db_ = str(row["Database"]).strip()
+            sch_ = str(row["Schema"]).strip()
+            vw_ = str(row["ViewName"]).strip()
+            sql_ = str(row["SelectStatement"]).strip().rstrip(';')
+            # Optional prompt if query does not start with SELECT
+            if not sql_.lower().startswith("select"):
+                proceed = messagebox.askyesno("Confirm", f"Query does not start with SELECT:\n{sql_}\nContinue?")
+                if not proceed:
+                    continue
+            self.all_queries.append({
+                "Database": db_,
+                "Schema": sch_,
+                "ViewName": vw_,
+                "SelectStatement": sql_
+            })
+            self.databases_available.add(db_)
+            self.query_text.insert(tk.END, f"DB={db_}, Schema={sch_}, View={vw_}\n   {sql_}\n\n")
+
+        self.query_text.config(state='disabled')
+        db_list = sorted(list(self.databases_available))
+        self.db_selector['values'] = ("All",) + tuple(db_list)
+
+        messagebox.showinfo("Loaded", f"Loaded {len(self.all_queries)} queries.")
+        self.log(f"Loaded {len(self.all_queries)} queries from {file_path}", logging.INFO)
+
+    # --------------------------------------------------
+    # 2) START ANALYSIS
+    # --------------------------------------------------
+    def start_analysis(self):
+        server = self.server_var.get().strip()
+        if not server:
+            messagebox.showwarning("Missing Server", "Enter a server name.")
+            return
+        if not self.all_queries:
+            messagebox.showwarning("No Queries", "Load queries first.")
+            return
+
+        # Reset states
+        self.pause_event.clear()
+        self.dataframes.clear()
+        self.relationship_df = pd.DataFrame()
+        self.total_queries = 0
+        self.completed_queries = 0
+        self.progress_bar['value'] = 0
+        self.progress_label.config(text="0%")
+        self.eta_label.config(text="ETA: --")
+        self.start_time = time.time()
+        self.query_stats.clear()
+
+        # Run the analysis in a separate thread to keep GUI responsive
+        threading.Thread(target=self.run_analysis, daemon=True).start()
+
+    def run_analysis(self):
+        mode = self.query_mode.get()
+        self.log(f"Running analysis in '{mode}' mode...", logging.INFO)
+
+        if mode == "Self":
+            self.run_self_analysis()
+        elif mode == "AllOther":
+            self.run_cross_database_analysis()
+        elif mode == "Both":
+            self.run_self_analysis()
+            self.run_cross_database_analysis()
+
+        self.log("Analysis complete.", logging.INFO)
+
+        # Email notify if enabled
+        if AppConfig.EMAIL_NOTIFICATIONS:
+            self.send_email_notification(
+                subject="Database Analysis Complete",
+                message="The database analysis has finished successfully."
+            )
+
+    # --------------------------------------------------
+    # SELF-ANALYSIS
+    # --------------------------------------------------
+    def run_self_analysis(self):
+        self.log("Starting self-analysis...", logging.INFO)
+        # Filter queries by the selected database (if not "All")
+        selected_db = self.selected_db_var.get()
+        queries_to_run = [q for q in self.all_queries if selected_db == "All" or q["Database"] == selected_db]
+        self.execute_queries_in_parallel(queries_to_run)
+
+    # --------------------------------------------------
+    # CROSS-DB ANALYSIS
+    # --------------------------------------------------
+    def run_cross_database_analysis(self):
+        self.log("Starting cross-database analysis...", logging.INFO)
+        # Possibly run queries across all DBs to compare or do relationship analysis
+        selected_db = self.selected_db_var.get()
+        if selected_db != "All":
+            self.log("Cross-database analysis is typically run on 'All' DBs, but continuing...", logging.WARNING)
+
+        queries_to_run = self.all_queries
+        self.execute_queries_in_parallel(queries_to_run)
+
+        # After queries, you could do specialized logic to discover cross-database relationships.
+
+    # --------------------------------------------------
+    # 3) PAUSE / RESUME
+    # --------------------------------------------------
+    def pause_analysis(self):
+        self.log("Analysis paused.", logging.INFO)
+        self.pause_event.set()
+
+    def resume_analysis(self):
+        self.log("Analysis resumed.", logging.INFO)
+        self.pause_event.clear()
+
+    # --------------------------------------------------
+    # 4) ADVANCED QUERY ANALYTICS
+    # --------------------------------------------------
+    def execute_query_with_analytics(self, query_info):
+        while self.pause_event.is_set():
+            time.sleep(1)  # Wait while paused
+
+        server = self.server_var.get().strip()
+        db_name = query_info["Database"]
+        sql_statement = query_info["SelectStatement"]
+
+        try:
+            self.log(f"Starting query '{query_info['ViewName']}' on database '{db_name}'.", logging.INFO)
+            # Time the execution
+            start_time = time.time()
+            conn_str = (
+                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                f"SERVER={server};"
+                f"DATABASE={db_name};"
+                f"Trusted_Connection=yes;"
+            )
+            cnxn = pyodbc.connect(conn_str, timeout=AppConfig.QUERY_TIMEOUT_SECS)
+            cursor = cnxn.cursor()
+
+            self.log(f"Executing query '{query_info['ViewName']}' on database '{db_name}'...", logging.INFO)
+            cursor.execute(sql_statement)
+
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame.from_records(rows, columns=columns)
+
+            end_time = time.time()
+            execution_time = end_time - start_time
+            self.log(f"Finished query '{query_info['ViewName']}' on database '{db_name}' in {execution_time:.2f} seconds.", logging.INFO)
+
+            cursor.close()
+            cnxn.close()
+
+            # Save the query to history
+            self.save_query_history(query_info)
+
+            return (query_info, df, execution_time)
+        except Exception as e:
+            self.log(f"Error executing query '{query_info['ViewName']}' on database '{db_name}': {e}", logging.ERROR)
+            return None
+
+    # --------------------------------------------------
+    # 5) DATA PREVIEW WITH PAGINATION
+    # --------------------------------------------------
+    def preview_data_paginated(self, dataframe, rows_per_page=100):
+        def show_page(page_num):
+            start_row = page_num * rows_per_page
+            end_row = start_row + rows_per_page
+            if start_row >= len(dataframe):
+                messagebox.showinfo("No More Data", "You have reached the end of the data.")
+                return
+
+            preview_window = tk.Toplevel(self.root)
+            preview_window.title(f"Data Preview (Page {page_num + 1})")
+            preview_window.geometry("1200x600")
+
+            cols = list(dataframe.columns)
+            tree = ttk.Treeview(preview_window, columns=cols, show="headings")
+            for col in cols:
+                tree.heading(col, text=col)
+                tree.column(col, width=150, anchor='center')
+
+            for row in dataframe.iloc[start_row:end_row].itertuples(index=False):
+                tree.insert("", "end", values=row)
+
+            tree.pack(fill="both", expand=True)
+
+            next_button = ttk.Button(preview_window, text="Next Page", command=lambda: show_page(page_num + 1))
+            next_button.pack(pady=5)
+
+        show_page(0)
+
+    # --------------------------------------------------
+    # 6) CLOUD INTEGRATION (Sample)
+    #    Adjust your DSN or driver for actual environment
+    # --------------------------------------------------
+    def connect_to_cloud_database(self, cloud_provider, db_config):
+        if cloud_provider.lower() == "aws":
+            conn_str = (
+                f"DRIVER={{PostgreSQL}};"
+                f"SERVER={db_config['host']};"
+                f"PORT={db_config['port']};"
+                f"DATABASE={db_config['database']};"
+                f"UID={db_config['user']};"
+                f"PWD={db_config['password']};"
+            )
+        elif cloud_provider.lower() == "azure":
+            conn_str = (
+                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                f"SERVER={db_config['server']};"
+                f"DATABASE={db_config['database']};"
+                f"UID={db_config['username']};"
+                f"PWD={db_config['password']};"
+            )
+        elif cloud_provider.lower() == "gcp":
+            conn_str = (
+                f"DRIVER={{BigQuery}};"
+                f"PROJECT_ID={db_config['project_id']};"
+                f"KEYFILE={db_config['keyfile']};"
+            )
+        else:
+            self.log("Unsupported cloud provider.", logging.ERROR)
+            return None
+
+        try:
+            cnxn = pyodbc.connect(conn_str)
+            self.log(f"Successfully connected to {cloud_provider} database.", logging.INFO)
+            return cnxn
+        except Exception as e:
+            self.log(f"Error connecting to {cloud_provider} database: {e}", logging.ERROR)
+            return None
+
+    # --------------------------------------------------
+    # 7) AUTOMATED ERROR RECOVERY (Retry logic)
+    # --------------------------------------------------
+    def retry_failed_query(self, query_info, max_retries=3):
+        retries = 0
+        while retries < max_retries:
+            self.log(f"Attempt {retries + 1} for query '{query_info['ViewName']}' on database '{query_info['Database']}'.", logging.INFO)
+            result = self.execute_query_with_analytics(query_info)
+            if result:
+                self.log(f"Query '{query_info['ViewName']}' succeeded on attempt {retries + 1}.", logging.INFO)
+                return result
+            retries += 1
+            self.log(f"Retry {retries}/{max_retries} for query '{query_info['ViewName']}'.", logging.WARNING)
+        self.log(f"Query '{query_info['ViewName']}' failed after {max_retries} retries. Ignoring this view.", logging.ERROR)
+        return None
+
+    # --------------------------------------------------
+    # 8) INTERACTIVE DATA CLEANING
+    # --------------------------------------------------
+    def open_data_cleaning_tool(self, dataframe):
+        tool_window = tk.Toplevel(self.root)
+        tool_window.title("Data Cleaning Tool")
+        tool_window.geometry("800x600")
+
+        ttk.Label(tool_window, text="Column:").pack()
+        col_selector = ttk.Combobox(tool_window, values=list(dataframe.columns))
+        col_selector.pack(pady=5)
+
+        def remove_duplicates():
+            col = col_selector.get()
+            if col:
+                clean_df = dataframe.drop_duplicates(subset=[col])
+                self.log(f"Removed duplicates in column '{col}'.", logging.INFO)
+                self.preview_data_paginated(clean_df)
+
+        ttk.Button(tool_window, text="Remove Duplicates", command=remove_duplicates).pack(pady=5)
+
+    # --------------------------------------------------
+    # 9) INTEGRATION WITH BI TOOLS (example: Tableau)
+    # --------------------------------------------------
+    def export_to_tableau(self, dataframe, server_url, project_name):
+        try:
+            from tableauserverclient import TableauAuth, Server
+
+            auth = TableauAuth("username", "password")
+            server = Server(server_url, use_server_version=True)
+            with server.auth.sign_in(auth):
+                # This is a placeholder. Actual publish logic may differ.
+                # Typically you'd publish packaged workbooks or hyper extracts, not CSV text directly.
+                # For demonstration, we assume you can pass CSV data.
+                csv_data = dataframe.to_csv(index=False)
+                # ... some logic to publish csv_data to the specified project
+                # For real code, see tableauserverclient documentation
+                self.log(f"Published to Tableau project '{project_name}'.", logging.INFO)
+        except Exception as e:
+            self.log(f"Error publishing to Tableau: {e}", logging.ERROR)
+
+    # --------------------------------------------------
+    # 10) QUERY HISTORY AND REUSE
+    # --------------------------------------------------
+    def save_query_history(self, query_info):
+        with open("query_history.log", "a") as f:
+            f.write(f"{datetime.now()} - {query_info['Database']} - {query_info['ViewName']} - {query_info['SelectStatement']}\n")
+
+    # --------------------------------------------------
+    # 11) ADVANCED RELATIONSHIP ANALYSIS
+    # --------------------------------------------------
+    def advanced_relationship_analysis(self):
+        self.rel_graph = nx.DiGraph()
+        for name, df in self.dataframes.items():
+            for col in df.columns:
+                self.rel_graph.add_node(f"{name}.{col}")
+                # Compare with other dataframes for potential column overlap
+                for other_name, other_df in self.dataframes.items():
+                    if other_name != name and col in other_df.columns:
+                        self.rel_graph.add_edge(f"{name}.{col}", f"{other_name}.{col}", label=col)
+        self.visualize_graph()
+
+    # --------------------------------------------------
+    # 12) SCHEDULED REPORTS
+    # --------------------------------------------------
+    def schedule_analysis(self):
+        self.log("Scheduling analysis...", logging.INFO)
+        # Example: schedule at 02:00 daily
+        schedule.every().day.at("02:00").do(self.start_analysis)
+        messagebox.showinfo("Scheduled", "Analysis scheduled at 02:00 daily.")
+
+    # --------------------------------------------------
+    # 13) REAL-TIME NOTIFICATIONS (Requires plyer)
+    # --------------------------------------------------
+    def notify_user(self, message):
+        try:
+            from plyer import notification
+            notification.notify(
+                title="Database Analyzer",
+                message=message,
+                app_name="DB Analyzer",
+                timeout=10
+            )
+        except ImportError:
+            self.log("plyer is not installed. Cannot show desktop notifications.", logging.WARNING)
+
+    # --------------------------------------------------
+    # 14) DYNAMIC QUERY FILTERING
+    # --------------------------------------------------
+    def filter_query_results(self, dataframe, filter_conditions):
+        filtered_df = dataframe
+        for col, value in filter_conditions.items():
+            filtered_df = filtered_df[filtered_df[col] == value]
+        self.preview_data_paginated(filtered_df)
+
+    # --------------------------------------------------
+    # 15) PARALLEL PROCESSING (EXECUTE QUERIES)
+    # --------------------------------------------------
+    def execute_queries_in_parallel(self, queries):
+        self.total_queries = len(queries)
+        self.start_time = time.time()
+        self.log(f"Executing {self.total_queries} queries in parallel with {AppConfig.MAX_WORKERS} workers.", logging.INFO)
+
+        with ThreadPoolExecutor(max_workers=AppConfig.MAX_WORKERS) as executor:
+            futures = {executor.submit(self.retry_failed_query, query): query for query in queries}
+            for future in as_completed(futures):
+                query = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        self.handle_query_result(*result)
+                    else:
+                        self.log(f"Query '{query['ViewName']}' on database '{query['Database']}' was ignored after retries.", logging.WARNING)
+                except Exception as e:
+                    self.log(f"Unhandled exception for query '{query['ViewName']}' on database '{query['Database']}': {e}", logging.ERROR)
+
+    # --------------------------------------------------
+    # 16) ENHANCED DASHBOARD
+    # --------------------------------------------------
+    def open_dashboard(self):
+        dashboard_window = tk.Toplevel(self.root)
+        dashboard_window.title("Real-Time Dashboard")
+        dashboard_window.geometry("800x600")
+
+        ttk.Label(dashboard_window, text="Query Statistics").pack(pady=10)
+        stats_frame = tk.Frame(dashboard_window)
+        stats_frame.pack(fill="both", expand=True)
+
+        columns = ("Query", "Database", "Rows Retrieved", "Status", "Execution Time (s)")
+        self.stats_table = ttk.Treeview(stats_frame, columns=columns, show="headings")
+        for col in columns:
+            self.stats_table.heading(col, text=col)
+            self.stats_table.column(col, width=150, anchor='center')
+        self.stats_table.pack(fill="both", expand=True)
+
+        ttk.Button(dashboard_window, text="Export Statistics", command=self.export_statistics).pack(pady=10)
+
+        # Periodically update the stats table
+        self.update_stats_table()
+
+    def update_stats_table(self):
+        if hasattr(self, "stats_table"):
+            for row in self.stats_table.get_children():
+                self.stats_table.delete(row)
+
+            for stat in self.query_stats:
+                self.stats_table.insert("", "end", values=(
+                    stat["Query"],
+                    stat["Database"],
+                    stat["Rows"],
+                    stat["Status"],
+                    f"{stat['ExecutionTime']:.2f}"
+                ))
+
+        self.root.after(5000, self.update_stats_table)  # Update every 5 seconds
+
+    # --------------------------------------------------
+    # 17) DARK MODE SUPPORT
+    # --------------------------------------------------
+    def toggle_dark_mode(self):
+        current_bg = self.root.cget("bg")
+        if current_bg == "black":
+            # Switch to light mode
+            self.root.configure(bg="white")
+            self.log_text.configure(bg="white", fg="black")
+            self.rel_text.configure(bg="white", fg="black")
+        else:
+            # Switch to dark mode
+            self.root.configure(bg="black")
+            self.log_text.configure(bg="black", fg="white")
+            self.rel_text.configure(bg="black", fg="white")
+
+    # --------------------------------------------------
+    # 18) SQL QUERY RUNNER (Ad-hoc console)
+    # --------------------------------------------------
+    def open_sql_console(self):
+        console_window = tk.Toplevel(self.root)
+        console_window.title("SQL Console")
+        console_window.geometry("800x600")
+
+        sql_text = scrolledtext.ScrolledText(console_window, height=10)
+        sql_text.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def run_query():
+            query = sql_text.get("1.0", tk.END).strip()
+            if query.lower().startswith("select"):
+                self.execute_query_console(query)
+            else:
+                messagebox.showerror("Invalid Query", "Only SELECT queries are allowed.")
+
+        ttk.Button(console_window, text="Run Query", command=run_query).pack(pady=10)
+
+    def execute_query_console(self, query):
+        """
+        Execute the provided SELECT query in the currently selected DB.
+        """
+        selected_db = self.selected_db_var.get()
+        if selected_db == "All":
+            messagebox.showerror("Invalid Selection", "Please select a specific database for ad-hoc queries.")
+            return
+
+        query_info = {
+            "Database": selected_db,
+            "Schema": "",
+            "ViewName": "AdHoc",
+            "SelectStatement": query
+        }
+        result = self.execute_query_with_analytics(query_info)
+        if result:
+            _, df, _ = result
+            self.preview_data_paginated(df)
+
+    # --------------------------------------------------
+    # 19) MULTI-FORMAT EXPORT (STATISTICS)
+    # --------------------------------------------------
+    def export_statistics(self):
+        """
+        Exports the 'query_stats' DataFrame in multiple formats.
+        """
+        if not self.query_stats:
+            messagebox.showwarning("No Statistics", "No statistics available to export.")
+            return
+        file_types = [
+            ("Excel Files", "*.xlsx"),
+            ("CSV Files", "*.csv"),
+            ("JSON Files", "*.json")
+        ]
+        file_path = filedialog.asksaveasfilename(title="Save Statistics", filetypes=file_types)
+        if not file_path:
+            return
+        try:
+            df_stats = pd.DataFrame(self.query_stats)
+            if file_path.endswith(".xlsx"):
+                df_stats.to_excel(file_path, index=False)
+            elif file_path.endswith(".csv"):
+                df_stats.to_csv(file_path, index=False)
+            elif file_path.endswith(".json"):
+                df_stats.to_json(file_path, orient="records")
+            else:
+                # Default to Excel if no recognized extension
+                df_stats.to_excel(file_path + ".xlsx", index=False)
+
+            messagebox.showinfo("Export Successful", f"Statistics exported to {file_path}")
+            self.log(f"Statistics exported to {file_path}", logging.INFO)
+        except Exception as e:
+            self.log(f"Export error: {e}", logging.ERROR)
+            messagebox.showerror("Export Error", str(e))
+
+    # --------------------------------------------------
+    # 20) LOGGING HELPER
+    # --------------------------------------------------
+    def log(self, message, level=logging.INFO):
+        logging.log(level, message)
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, f"{datetime.now()} - {logging.getLevelName(level)}: {message}\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+
+    # --------------------------------------------------
+    # HANDLE QUERY RESULT
+    # --------------------------------------------------
+    def handle_query_result(self, query_info, df, execution_time):
+        # Store dataframe by "Database.ViewName"
+        view_key = f"{query_info['Database']}.{query_info['ViewName']}"
+        self.dataframes[view_key] = df
+
+        # Update progress
+        with self.lock:
+            self.completed_queries += 1
+            progress_percent = (self.completed_queries / self.total_queries) * 100
+            self.progress_bar['value'] = progress_percent
+            self.progress_label.config(text=f"{progress_percent:.1f}%")
+
+            # Estimate time remaining
+            elapsed = time.time() - self.start_time
+            queries_done = self.completed_queries
+            if queries_done > 0:
+                time_per_query = elapsed / queries_done
+                remaining = self.total_queries - queries_done
+                eta = time_per_query * remaining
+                self.eta_label.config(text=f"ETA: {eta:.1f}s")
+            else:
+                self.eta_label.config(text="ETA: --")
+
+        rows_fetched = len(df)
+        self.log(f"Query finished: {view_key}, rows={rows_fetched}, time={execution_time:.2f}s", logging.INFO)
+
+        # Append or update stats for dashboard
+        stat_entry = {
+            "Query": query_info["ViewName"],
+            "Database": query_info["Database"],
+            "Rows": rows_fetched,
+            "Status": "Completed",
+            "ExecutionTime": execution_time
+        }
+        self.query_stats.append(stat_entry)
+
+    # --------------------------------------------------
+    # 21) EXPORT REPORT (Relationship Analysis)
+    # --------------------------------------------------
+    def export_report(self):
+        if self.relationship_df.empty:
+            messagebox.showwarning("No Report", "No relationships to export.")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension='.xlsx',
+            filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")],
+            title="Save Relationship Report"
+        )
+        if not file_path:
+            return
+        try:
+            self.relationship_df.to_excel(file_path, index=False)
+            messagebox.showinfo("Export Success", f"Report saved to {file_path}")
+            self.log(f"Report saved to {file_path}", logging.INFO)
+        except Exception as e:
+            self.log(f"Export error: {e}", logging.ERROR)
+            messagebox.showerror("Export Error", str(e))
+
+    # --------------------------------------------------
+    # VISUALIZE GRAPH
+    # --------------------------------------------------
+    def visualize_graph(self):
+        if not self.rel_graph:
+            messagebox.showwarning("No Graph", "No relationship graph to visualize.")
+            return
+        plt.figure(figsize=(10, 7))
+        pos = nx.spring_layout(self.rel_graph, seed=42)
+        nx.draw_networkx_nodes(self.rel_graph, pos, node_color='lightblue', node_size=2000)
+        nx.draw_networkx_labels(self.rel_graph, pos)
+        edge_labels = nx.get_edge_attributes(self.rel_graph, 'label')
+        nx.draw_networkx_edges(self.rel_graph, pos, edge_color='gray')
+        nx.draw_networkx_edge_labels(self.rel_graph, pos, edge_labels=edge_labels, font_size=7)
+        plt.title("Relationship Graph")
+        plt.axis('off')
+        plt.show()
+
+    # --------------------------------------------------
+    # INTEGRATE RELATIONSHIP VISUALIZATION
+    # --------------------------------------------------
+    def visualize_relationships(self):
+        if not self.rel_graph:
+            messagebox.showwarning("No Relationships", "No relationship data available to visualize.")
+            return
+        plt.figure(figsize=(10, 7))
+        pos = nx.spring_layout(self.rel_graph, seed=42)
+        nx.draw_networkx_nodes(self.rel_graph, pos, node_color='lightgreen', node_size=2000)
+        nx.draw_networkx_labels(self.rel_graph, pos)
+        edge_labels = nx.get_edge_attributes(self.rel_graph, 'label')
+        nx.draw_networkx_edges(self.rel_graph, pos, edge_color='gray')
+        nx.draw_networkx_edge_labels(self.rel_graph, pos, edge_labels=edge_labels, font_size=7)
+        plt.title("Relationship Graph")
+        plt.axis('off')
+        plt.show()
+
+    # --------------------------------------------------
+    # 22) AI-Assisted JOIN Statement Generation
+    # --------------------------------------------------
+    def open_ai_join_window(self):
+        # Create a new window
+        ai_window = tk.Toplevel(self.root)
+        ai_window.title("AI-Assisted JOIN Statement Generator")
+        ai_window.geometry("900x700")
+
+        # Instruction Label
+        ttk.Label(ai_window, text="Select Tables and Columns for JOIN Statement:", font=("Helvetica", 12)).pack(pady=10)
+
+        # Frame to hold table selection rows
+        tables_frame = tk.Frame(ai_window)
+        tables_frame.pack(pady=10, padx=10, fill='both', expand=True)
+
+        # List to keep track of table selection rows
+        self.join_table_rows = []
+
+        # Function to add a new table selection row
+        def add_table_row():
+            row = self.JoinTableRow(tables_frame, self)
+            self.join_table_rows.append(row)
+            row.pack(fill='x', pady=5)
+
+        # Function to remove the last table selection row
+        def remove_table_row():
+            if self.join_table_rows:
+                row = self.join_table_rows.pop()
+                row.destroy()
+
+        # Add initial two table selection rows
+        add_table_row()
+        add_table_row()
+
+        # Buttons to add or remove table rows
+        buttons_frame = tk.Frame(ai_window)
+        buttons_frame.pack(pady=5)
+
+        ttk.Button(buttons_frame, text="Add Table", command=add_table_row).pack(side='left', padx=5)
+        ttk.Button(buttons_frame, text="Remove Table", command=remove_table_row).pack(side='left', padx=5)
+
+        # Frame for JOIN type selection
+        join_type_frame = tk.Frame(ai_window)
+        join_type_frame.pack(pady=10, padx=10)
+
+        ttk.Label(join_type_frame, text="Select JOIN Type:", font=("Helvetica", 12)).grid(row=0, column=0, padx=5, pady=5, sticky='e')
+        join_type_selector = ttk.Combobox(join_type_frame, state="readonly", values=["INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL OUTER JOIN"], width=30)
+        join_type_selector.grid(row=0, column=1, padx=5, pady=5)
+        join_type_selector.current(0)  # Default to INNER JOIN
+
+        # Button to generate JOIN statement
+        generate_button = ttk.Button(ai_window, text="Generate JOIN Statement", command=lambda: self.generate_join_statement(ai_window, join_type_selector))
+        generate_button.pack(pady=10)
+
+        # Style for the Generate button
+        style = ttk.Style()
+        style.configure("TButton", foreground="white", background="#4CAF50")
+        style.map("TButton",
+                  foreground=[('active', 'white')],
+                  background=[('active', '#45a049')])
+
+    class JoinTableRow(ttk.Frame):
+        def __init__(self, parent, app, *args, **kwargs):
+            super().__init__(parent, *args, **kwargs)
+            self.app = app
+
+            # Database selection
+            ttk.Label(self, text="Select Database:").grid(row=0, column=0, padx=5, pady=5, sticky='e')
+            self.db_var = tk.StringVar()
+            self.db_combobox = ttk.Combobox(self, textvariable=self.db_var, state="readonly", width=25)
+            self.db_combobox['values'] = sorted(list(self.app.databases_available))
+            self.db_combobox.grid(row=0, column=1, padx=5, pady=5)
+            self.db_combobox.bind("<<ComboboxSelected>>", self.populate_tables)
+
+            # Table selection
+            ttk.Label(self, text="Select Table:").grid(row=0, column=2, padx=5, pady=5, sticky='e')
+            self.table_var = tk.StringVar()
+            self.table_combobox = ttk.Combobox(self, textvariable=self.table_var, state="readonly", width=25)
+            self.table_combobox.grid(row=0, column=3, padx=5, pady=5)
+            self.table_combobox.bind("<<ComboboxSelected>>", self.populate_columns)
+
+            # Column selection
+            ttk.Label(self, text="Select Column for JOIN:").grid(row=0, column=4, padx=5, pady=5, sticky='e')
+            self.column_var = tk.StringVar()
+            self.column_combobox = ttk.Combobox(self, textvariable=self.column_var, state="readonly", width=25)
+            self.column_combobox.grid(row=0, column=5, padx=5, pady=5)
+
+        def populate_tables(self, event=None):
+            selected_db = self.db_var.get()
+            related_tables = sorted([q["ViewName"] for q in self.app.all_queries if q["Database"] == selected_db])
+            self.table_combobox['values'] = related_tables
+            if related_tables:
+                self.table_combobox.current(0)
+                self.populate_columns()
+
+        def populate_columns(self, event=None):
+            selected_db = self.db_var.get()
+            selected_table = self.table_var.get()
+            columns = []
+            for q in self.app.all_queries:
+                if q["Database"] == selected_db and q["ViewName"] == selected_table:
+                    columns = self.app.extract_columns(q["SelectStatement"])
+                    break
+            self.column_combobox['values'] = columns
+            if columns:
+                self.column_combobox.current(0)
+
+    def extract_columns(self, select_stmt):
+        try:
+            # Use sqlparse to extract column names
+            parsed = sqlparse.parse(select_stmt)[0]
+            columns = []
+            select_seen = False
+            for token in parsed.tokens:
+                if token.ttype is sqlparse.tokens.DML and token.value.upper() == 'SELECT':
+                    select_seen = True
+                elif select_seen:
+                    if isinstance(token, sqlparse.sql.IdentifierList):
+                        for identifier in token.get_identifiers():
+                            col = identifier.get_real_name()
+                            if col:
+                                columns.append(col)
+                    elif isinstance(token, sqlparse.sql.Identifier):
+                        col = token.get_real_name()
+                        if col:
+                            columns.append(col)
+                    elif token.ttype is sqlparse.tokens.Keyword:
+                        break
+            # Capitalize column names (optional)
+            columns = [col.capitalize() for col in columns]
+            return columns
+        except Exception as e:
+            self.log(f"Error extracting columns using sqlparse: {e}", logging.ERROR)
+            return []
+
+    def generate_join_statement(self, ai_window, join_type_selector):
+        tables_info = []
+        for row in self.join_table_rows:
+            db = row.db_var.get()
+            table = row.table_var.get()
+            column = row.column_var.get()
+            if not (db and table and column):
+                messagebox.showwarning("Incomplete Selection", "Please select database, table, and column for all tables.")
+                return
+            tables_info.append({
+                "Database": db,
+                "Table": table,
+                "Column": column
+            })
+
+        if len(tables_info) < 2:
+            messagebox.showwarning("Insufficient Tables", "At least two tables are required to generate a JOIN statement.")
+            return
+
+        join_type = join_type_selector.get()
+
+        # Construct the prompt for OpenAI
+        prompt = "I want to generate an SQL JOIN statement based on the following tables and columns:\n\n"
+        for i, tbl in enumerate(tables_info, start=1):
+            prompt += f"Table {i}: '{tbl['Table']}' from database '{tbl['Database']}' on column '{tbl['Column']}'\n"
+        prompt += f"\nPlease provide an optimized SQL {join_type} statement for this scenario."
+
+        # Disable the button to prevent multiple clicks
+        generate_button = None
+        for widget in ai_window.winfo_children():
+            if isinstance(widget, ttk.Button) and widget['text'] == "Generate JOIN Statement":
+                generate_button = widget
+                break
+
+        if generate_button:
+            generate_button.config(state='disabled', text='Generating...')
+
+        # Start a new thread to call AI to keep GUI responsive
+        threading.Thread(target=self.call_ai_generate_join, args=(prompt, ai_window, generate_button), daemon=True).start()
+
+    def call_ai_generate_join(self, prompt, ai_window, generate_button):
+        if not AppConfig.OPENAI_API_KEY:
+            self.log("OpenAI API key not found. Please set it in environment variables.", logging.ERROR)
+            messagebox.showerror("API Key Missing", "OpenAI API key not found. Please set it in environment variables.")
+            if generate_button:
+                self.root.after(0, lambda: generate_button.config(state='normal', text='Generate JOIN Statement'))
+            return
+
+        openai.api_key = AppConfig.OPENAI_API_KEY
+
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert SQL developer."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=500  # Increased to allow more complex JOINs
+            )
+
+            join_statement = response.choices[0].message['content'].strip()
+
+            # Display the generated JOIN statement
+            self.display_join_statement(join_statement, ai_window)
+
+        except Exception as e:
+            self.log(f"Error communicating with OpenAI API: {e}", logging.ERROR)
+            messagebox.showerror("AI Error", f"An error occurred while generating the JOIN statement: {e}")
+        finally:
+            # Re-enable the Generate button
+            if generate_button:
+                self.root.after(0, lambda: generate_button.config(state='normal', text='Generate JOIN Statement'))
+
+    def display_join_statement(self, join_statement, ai_window):
+        # Clear previous content if any
+        for widget in ai_window.winfo_children():
+            if isinstance(widget, scrolledtext.ScrolledText):
+                widget.delete('1.0', tk.END)
+
+        # Create a text widget to display the JOIN statement
+        ttk.Label(ai_window, text="Generated JOIN Statement:", font=("Helvetica", 12)).pack(pady=10)
+        join_text = scrolledtext.ScrolledText(ai_window, height=10, wrap='word', state='normal')
+        join_text.pack(padx=10, pady=5)
+        join_text.insert(tk.END, join_statement)
+        join_text.config(state='disabled')
+
+        # Button to copy the JOIN statement to clipboard
+        def copy_to_clipboard():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(join_statement)
+            messagebox.showinfo("Copied", "JOIN statement copied to clipboard.")
+
+        ttk.Button(ai_window, text="Copy to Clipboard", command=copy_to_clipboard).pack(pady=10)
+
+        # Button to close the window after successful generation
+        ttk.Button(ai_window, text="Close", command=ai_window.destroy).pack(pady=5)
+
+    # --------------------------------------------------
+    # OPTIONAL: SEND EMAIL NOTIFICATION
+    # --------------------------------------------------
+    def send_email_notification(self, subject, message, attachment=None):
+        """
+        Sends an email notification with optional attachment if AppConfig.EMAIL_NOTIFICATIONS is True.
+        """
+        if not AppConfig.EMAIL_NOTIFICATIONS:
+            return
+        try:
+            config = AppConfig.EMAIL_CONFIG
+            sender = config["sender"]
+            recipient = config["recipient"]
+            password = config["password"]
+
+            msg = MIMEMultipart()
+            msg["From"] = sender
+            msg["To"] = recipient
+            msg["Subject"] = subject
+            msg.attach(MIMEText(message, "plain"))
+
+            # If there's an attachment, attach it
+            if attachment:
+                from email.mime.base import MIMEBase
+                from email import encoders
+
+                with open(attachment, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(attachment)}"')
+                msg.attach(part)
+
+            server = smtplib.SMTP(config["smtp_server"], config["smtp_port"])
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+            server.quit()
+
+            self.log(f"Email notification sent to {recipient}", logging.INFO)
+        except Exception as e:
+            self.log(f"Error sending email: {e}", logging.ERROR)
+
+    # --------------------------------------------------
+    # 23) ADVANCED RELATIONSHIP ANALYSIS (Optional)
+    # --------------------------------------------------
+    def advanced_relationship_analysis(self):
+        self.rel_graph = nx.DiGraph()
+        for name, df in self.dataframes.items():
+            for col in df.columns:
+                self.rel_graph.add_node(f"{name}.{col}")
+                # Compare with other dataframes for potential column overlap
+                for other_name, other_df in self.dataframes.items():
+                    if other_name != name and col in other_df.columns:
+                        self.rel_graph.add_edge(f"{name}.{col}", f"{other_name}.{col}", label=col)
+        self.visualize_graph()
+
+    # --------------------------------------------------
+    # 24) GENERATE EXCEL FROM SERVER
+    # --------------------------------------------------
+    def generate_excel_from_server(self):
+        server = self.server_var.get().strip()
+        if not server:
+            messagebox.showwarning("Missing Server", "Please enter a valid server name.")
+            return
+
+        # Retrieve last used save directory (optional)
+        initial_dir = AppConfig.get_save_directory()
+        if not initial_dir or not os.path.isdir(initial_dir):
+            initial_dir = os.path.expanduser("~")  # Default to user home directory
+
+        # Prompt user to choose save location
+        file_path = filedialog.asksaveasfilename(
+            initialdir=initial_dir,
+            defaultextension='.xlsx',
+            filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")],
+            title="Save Excel File As"
+        )
+        if not file_path:
+            self.log("Excel generation canceled by user.", logging.INFO)
+            return  # User canceled the save dialog
+
+        # Save the directory for future use (optional)
+        save_dir = os.path.dirname(file_path)
+        AppConfig.set_save_directory(save_dir)
+
+        try:
+            conn = pyodbc.connect(
+                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                f"SERVER={server};"
+                f"Trusted_Connection=yes;"
+            )
+            cursor = conn.cursor()
+
+            databases_query = """
+            SELECT name FROM sys.databases WHERE state = 0 AND name NOT IN ('master', 'model', 'msdb', 'tempdb');
+            """
+            cursor.execute(databases_query)
+            databases = cursor.fetchall()
+
+            data = []
+            for db_row in databases:
+                db_name = db_row[0]
+                try:
+                    views_query = f"""
+                    SELECT TABLE_SCHEMA, TABLE_NAME 
+                    FROM [{db_name}].INFORMATION_SCHEMA.VIEWS;
+                    """
+                    cursor.execute(views_query)
+                    views = cursor.fetchall()
+                    for schema, view in views:
+                        data.append({
+                            "Database": db_name,
+                            "Schema": schema,
+                            "ViewName": view,
+                            "SelectStatement": f"SELECT TOP 10 * FROM [{db_name}].[{schema}].[{view}];"
+                        })
+                except Exception as e:
+                    self.log(f"Error processing database '{db_name}': {e}", logging.WARNING)
+
+            df = pd.DataFrame(data)
+            df.to_excel(file_path, index=False)
+            messagebox.showinfo("Success", f"Excel saved to {file_path}")
+            self.log(f"Generated Excel file at {file_path}", logging.INFO)
+
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            self.log(f"Error generating Excel: {e}", logging.ERROR)
+            messagebox.showerror("Error", f"Failed to generate Excel: {e}")
+
+    # --------------------------------------------------
+    # ENTRY POINT
+    # --------------------------------------------------
+def main():
+    root = tk.Tk()
+    app = DatabaseAnalyzerApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
